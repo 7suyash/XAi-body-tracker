@@ -2,6 +2,10 @@ import cv2
 import mediapipe as mp
 import math
 import pyttsx3
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Only output errors
+import tensorflow as tf  # If you use TF explicitly somewhere
+
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
@@ -40,7 +44,10 @@ def mock_xai_explanation(knee_angle, hip_angle):
     else:
         return "Good squat form! Keep it up!"
 
-cap = cv2.VideoCapture(0)
+#    Instead of local camera (0)
+
+cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)  # try 0, 1, 2, 3
+
 with mp_pose.Pose(min_detection_confidence=0.5,
                   min_tracking_confidence=0.5) as pose:
 
