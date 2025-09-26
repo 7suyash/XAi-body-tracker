@@ -2,138 +2,233 @@ import cv2
 import mediapipe as mp
 import math
 import pyttsx3
+import time
+from typing import Tuple, Optional, List, Dict, Any
 
-mp_drawing = mp.solutions.drawing_utils
+# ==============================================================================
+# Constants and Configuration
+# ==============================================================================
+
+# --- Pose Landmarks ---
 mp_pose = mp.solutions.pose
+PoseLandmark = mp_pose.PoseLandmark
 
-engine = pyttsx3.init()
-engine.setProperty('rate', 150)  # Speech speed
-last_spoken = ""  # Track last spoken feedback to avoid repeats
-entered_frame_spoken = False  # To track if half-body entry message was spoken
+# --- Drawing ---
+mp_drawing = mp.solutions.drawing_utils
+DRAWING_SPEC = mp_drawing.DrawingSpec(thickness=2, circle_radius=2)
 
-def calculate_angle(a, b, c):
-    a = [a.x, a.y]
-    b = [b.x, b.y]
-    c = [c.x, c.y]
+# --- Squat Form Angles (in degrees) ---
+KNEE_ANGLE_IDEAL = 90.0
+KNEE_ANGLE_RANGE = (70.0, 110.0)
+HIP_ANGLE_IDEAL = 95.0
+HIP_ANGLE_RANGE = (70.0, 120.0)
 
-    ba = [a[0] - b[0], a[1] - b[1]]
-    bc = [c[0] - b[0], c[1] - b[1]]
+# --- Visibility & Confidence Thresholds ---
+MIN_VISIBILITY_THRESHOLD = 0.7  # Increased for more reliable detection
+MIN_DETECTION_CONFIDENCE = 0.5
+MIN_TRACKING_CONFIDENCE = 0.5
 
-    dot_product = ba[0]*bc[0] + ba[1]*bc[1]
-    mag_ba = math.sqrt(ba[0]**2 + ba[1]**2)
-    mag_bc = math.sqrt(bc[0]**2 + bc[1]**2)
+# --- Feedback Timing ---
+VOICE_FEEDBACK_COOLDOWN = 3  # seconds
 
-    angle = math.acos(dot_product / (mag_ba * mag_bc))
-    return math.degrees(angle)
+# --- Text & Color Settings ---
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+COLOR_INFO = (255, 255, 0)      # Cyan for angles and XAI
+COLOR_GOOD = (0, 255, 0)        # Green for good form
+COLOR_ERROR = (0, 0, 255)       # Red for adjustments
 
-def mock_xai_explanation(knee_angle, hip_angle):
-    KNEE_IDEAL = 90
-    HIP_IDEAL = 95
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
 
-    knee_diff = abs(knee_angle - KNEE_IDEAL)
-    hip_diff = abs(hip_angle - HIP_IDEAL)
+def initialize_voice_engine() -> pyttsx3.Engine:
+    """Initializes and configures the text-to-speech engine."""
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 160)  # Slightly faster for more fluid feedback
+    return engine
+
+def calculate_angle(a: Dict[str, float], b: Dict[str, float], c: Dict[str, float]) -> float:
+    """
+    Calculates the angle between three 2D points (e.g., elbow angle).
+    Points a, b, and c are landmark coordinates. Angle is calculated at point b.
+    """
+    try:
+        # Vector subtraction to get vectors from b to a and b to c
+        vec_ba = (a['x'] - b['x'], a['y'] - b['y'])
+        vec_bc = (c['x'] - b['x'], c['y'] - b['y'])
+
+        # Dot product of the two vectors
+        dot_product = vec_ba[0] * vec_bc[0] + vec_ba[1] * vec_bc[1]
+
+        # Magnitude (length) of each vector
+        mag_ba = math.sqrt(vec_ba[0]**2 + vec_ba[1]**2)
+        mag_bc = math.sqrt(vec_bc[0]**2 + vec_bc[1]**2)
+
+        # Cosine of the angle
+        cosine_angle = dot_product / (mag_ba * mag_bc)
+        
+        # Ensure the value is within the valid range for acos to avoid math domain errors
+        cosine_angle = max(-1.0, min(1.0, cosine_angle))
+
+        # Calculate angle in radians and convert to degrees
+        angle = math.acos(cosine_angle)
+        return math.degrees(angle)
+    except (ZeroDivisionError, ValueError):
+        # Return a neutral angle if calculation is not possible
+        return 0.0
+
+def are_landmarks_visible(landmarks: List[PoseLandmark], landmark_data: Any) -> bool:
+    """Checks if a list of essential landmarks have high visibility."""
+    return all(landmark_data[lm.value].visibility > MIN_VISIBILITY_THRESHOLD for lm in landmarks)
+
+
+def provide_voice_feedback(engine: pyttsx3.Engine, text: str, last_feedback: Dict[str, Any]) -> None:
+    """
+    Provides voice feedback if the message is new and cooldown has passed.
+    """
+    current_time = time.time()
+    if (text != last_feedback['text'] or 
+        (current_time - last_feedback['time']) > VOICE_FEEDBACK_COOLDOWN):
+        engine.say(text)
+        engine.runAndWait()
+        last_feedback['text'] = text
+        last_feedback['time'] = current_time
+
+def generate_xai_explanation(knee_angle: float, hip_angle: float) -> str:
+    """
+    Generates a simple, mock Explainable AI (XAI) feedback message.
+    Prioritizes feedback on the joint with the largest deviation from ideal.
+    """
+    knee_diff = abs(knee_angle - KNEE_ANGLE_IDEAL)
+    hip_diff = abs(hip_angle - HIP_ANGLE_IDEAL)
+    
+    # Give a small tolerance before providing feedback
+    if knee_diff < 5 and hip_diff < 5:
+        return "Excellent squat form! Keep it up!"
 
     if knee_diff > hip_diff:
-        return f"Knee angle off by {int(knee_diff)} degrees, adjust your knee."
-    elif hip_diff > knee_diff:
-        return f"Hip angle off by {int(hip_diff)} degrees, adjust your hips."
+        return f"Focus on your knee. It's off by {int(knee_diff)} degrees."
     else:
-        return "Good squat form! Keep it up!"
+        return f"Focus on your hips. They're off by {int(hip_diff)} degrees."
 
-cap = cv2.VideoCapture(0)
-with mp_pose.Pose(min_detection_confidence=0.5,
-                  min_tracking_confidence=0.5) as pose:
+def draw_text(image: Any, text: str, position: Tuple[int, int], color: Tuple[int, int, int], scale: float = 1.0, thickness: int = 2):
+    """Utility to draw text on the image with a consistent style."""
+    cv2.putText(image, text, position, FONT, scale, color, thickness, cv2.LINE_AA)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+# ==============================================================================
+# Main Application Logic
+# ==============================================================================
 
-        frame = cv2.flip(frame, 1)  # mirror horizontally
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image.flags.writeable = False
+def main():
+    """Main function to run the squat analysis application."""
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open video stream.")
+        return
+        
+    engine = initialize_voice_engine()
+    
+    # State tracking variables
+    last_feedback = {'text': "", 'time': 0}
+    full_body_in_frame_spoken = False
 
-        results = pose.process(image)
+    # Define essential landmarks for squat analysis
+    essential_landmarks = [
+        PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER,
+        PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP,
+        PoseLandmark.LEFT_KNEE, PoseLandmark.RIGHT_KNEE,
+        PoseLandmark.LEFT_ANKLE, PoseLandmark.RIGHT_ANKLE,
+    ]
 
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    with mp_pose.Pose(min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+                      min_tracking_confidence=MIN_TRACKING_CONFIDENCE) as pose:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
+            # --- Image Processing ---
+            frame = cv2.flip(frame, 1) # Mirror image for a more natural feel
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_rgb.flags.writeable = False # Performance optimization
+            results = pose.process(image_rgb)
+            image_rgb.flags.writeable = True
+            image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
-            # Half body visibility detection
-            important_landmarks = [
-                mp_pose.PoseLandmark.RIGHT_SHOULDER,
-                mp_pose.PoseLandmark.LEFT_SHOULDER,
-                mp_pose.PoseLandmark.RIGHT_HIP,
-                mp_pose.PoseLandmark.LEFT_HIP,
-                mp_pose.PoseLandmark.RIGHT_KNEE,
-                mp_pose.PoseLandmark.LEFT_KNEE,
-                mp_pose.PoseLandmark.RIGHT_ANKLE,
-                mp_pose.PoseLandmark.LEFT_ANKLE,
-            ]
+            # --- Landmark Detection and Analysis ---
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                
+                # Draw landmarks on the image
+                mp_drawing.draw_landmarks(
+                    image,
+                    results.pose_landmarks,
+                    mp_pose.POSE_CONNECTIONS,
+                    landmark_drawing_spec=DRAWING_SPEC,
+                    connection_drawing_spec=DRAWING_SPEC)
 
-            visible_count = sum(1 for lm in important_landmarks if landmarks[lm].visibility > 0.5)
-            half_body_visible = visible_count >= len(important_landmarks) // 2
+                # Check if the full body is visible
+                if are_landmarks_visible(essential_landmarks, landmarks):
+                    if not full_body_in_frame_spoken:
+                        provide_voice_feedback(engine, "Full body detected. You are ready to squat.", last_feedback)
+                        full_body_in_frame_spoken = True
 
-            # Announce once when half body comes into frame
-            if half_body_visible and not entered_frame_spoken:
-                engine.say("Half body detected, you are well in frame.")
-                engine.runAndWait()
-                entered_frame_spoken = True
-            elif not half_body_visible:
-                entered_frame_spoken = False
+                    # Extract landmark coordinates
+                    shoulder_r = landmarks[PoseLandmark.RIGHT_SHOULDER.value]
+                    hip_r = landmarks[PoseLandmark.RIGHT_HIP.value]
+                    knee_r = landmarks[PoseLandmark.RIGHT_KNEE.value]
+                    ankle_r = landmarks[PoseLandmark.RIGHT_ANKLE.value]
+                    
+                    # Calculate angles
+                    knee_angle = calculate_angle({'x': hip_r.x, 'y': hip_r.y}, 
+                                                 {'x': knee_r.x, 'y': knee_r.y}, 
+                                                 {'x': ankle_r.x, 'y': ankle_r.y})
+                    hip_angle = calculate_angle({'x': shoulder_r.x, 'y': shoulder_r.y}, 
+                                                {'x': hip_r.x, 'y': hip_r.y}, 
+                                                {'x': knee_r.x, 'y': knee_r.y})
 
-            hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
-            knee = landmarks[mp_pose.PoseLandmark.RIGHT_KNEE]
-            ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
+                    # Display angle info
+                    draw_text(image, f'Knee Angle: {int(knee_angle)}', (50, 50), COLOR_INFO)
+                    draw_text(image, f'Hip Angle: {int(hip_angle)}', (50, 100), COLOR_INFO)
 
-            if hip.visibility > 0.5 and knee.visibility > 0.5 and ankle.visibility > 0.5:
-                knee_angle = calculate_angle(hip, knee, ankle)
-                hip_angle = calculate_angle(knee, hip, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER])
+                    # --- Form Evaluation ---
+                    is_knee_good = KNEE_ANGLE_RANGE[0] <= knee_angle <= KNEE_ANGLE_RANGE[1]
+                    is_hip_good = HIP_ANGLE_RANGE[0] <= hip_angle <= HIP_ANGLE_RANGE[1]
 
-                cv2.putText(image, f'Knee Angle: {int(knee_angle)}', (50,50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2, cv2.LINE_AA)
-                cv2.putText(image, f'Hip Angle: {int(hip_angle)}', (50,100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2, cv2.LINE_AA)
+                    feedback_text = ""
+                    if is_knee_good and is_hip_good:
+                        draw_text(image, 'Good Squat Form!', (50, 150), COLOR_GOOD, scale=1.2, thickness=3)
+                        feedback_text = "Good form."
+                    else:
+                        if not is_knee_good:
+                            draw_text(image, 'Adjust Knee Angle', (50, 150), COLOR_ERROR, thickness=3)
+                        if not is_hip_good:
+                            draw_text(image, 'Adjust Hip Angle', (50, 200), COLOR_ERROR, thickness=3)
 
-                KNEE_ANGLE_MIN, KNEE_ANGLE_MAX = 70, 110
-                HIP_ANGLE_MIN, HIP_ANGLE_MAX = 70, 120
+                    # Generate and display XAI feedback
+                    xai_explanation = generate_xai_explanation(knee_angle, hip_angle)
+                    draw_text(image, xai_explanation, (50, 250), COLOR_INFO, scale=0.7)
+                    
+                    # Provide voice feedback based on XAI
+                    provide_voice_feedback(engine, xai_explanation, last_feedback)
 
-                knee_good = KNEE_ANGLE_MIN <= knee_angle <= KNEE_ANGLE_MAX
-                hip_good = HIP_ANGLE_MIN <= hip_angle <= HIP_ANGLE_MAX
+                else:
+                    # Reset state if body goes out of frame
+                    full_body_in_frame_spoken = False
+                    draw_text(image, 'Please make your full body visible', (50, 50), COLOR_ERROR, thickness=2)
+                    provide_voice_feedback(engine, "Please position your full body in the frame.", last_feedback)
 
-                if not knee_good:
-                    cv2.putText(image, 'Adjust knee angle', (50, 150),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3, cv2.LINE_AA)
-                if not hip_good:
-                    cv2.putText(image, 'Adjust hip angle', (50, 200),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3, cv2.LINE_AA)
-                if knee_good and hip_good:
-                    cv2.putText(image, 'Good squat form!', (50, 150),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3, cv2.LINE_AA)
+            # --- Display Frame ---
+            cv2.imshow('Optimized Squat Form Analyzer', image)
 
-                explanation = mock_xai_explanation(knee_angle, hip_angle)
-                cv2.putText(image, explanation, (50, 250),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+            if cv2.waitKey(5) & 0xFF == ord('q'):
+                break
 
-                # Voice feedback for form correction
-                if explanation != last_spoken:
-                    engine.say(explanation)
-                    engine.runAndWait()
-                    last_spoken = explanation
+    # --- Cleanup ---
+    cap.release()
+    cv2.destroyAllWindows()
+    engine.stop()
 
-            else:
-                cv2.putText(image, 'Body part not fully visible', (50,50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2, cv2.LINE_AA)
+if __name__ == '__main__':
+    main()
 
-            mp_drawing.draw_landmarks(
-                image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-        cv2.imshow('Squat Angle Detection with Voice Feedback', image)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-cap.release()
-cv2.destroyAllWindows()
